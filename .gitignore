@@ -1,0 +1,29 @@
+# ==========================================
+# .gitignore - Projeto Engenharia de Dados
+# ==========================================
+
+# 1. Credenciais e Variáveis de Ambiente (CRÍTICO)
+.env
+*.json
+credentials.json
+client_secret.json
+gcp_credentials.json
+
+# 2. Ambientes Virtuais Python (Evita subir milhares de arquivos de libs)
+venv/
+env/
+.venv/
+Scripts/
+Lib/
+
+# 3. Cache do Python (Arquivos compilados que não precisam de versionamento)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 4. Arquivos de Dados Locais (Evita subir CSVs e Parquets pesados pro GitHub)
+data/
+*.csv
+*.xlsx
+*.parquet
+*.log
