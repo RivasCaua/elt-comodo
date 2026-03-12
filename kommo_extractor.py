@@ -861,15 +861,21 @@ class KommoExtractor:
 
 
 def main():
+    KommoUtils.renovar_chaves()
+
     extractor = KommoExtractor()
+
+    # Dimensões - WRITE_TRUNCATE, sem incremental
     extractor.extrair_contas()
     extractor.extrair_tags()
     extractor.extrair_usuarios()
     extractor.extrair_pipelines_e_statuses()
-    # extrair_listas()
-    # extrair_leads()
-    # extrair_tarefas()
-    # extrair_eventos()
+    extractor.extrair_listas()
+
+    # Fatos - incrementais, WRITE_APPEND
+    extractor.extrair_tarefas()
+    extractor.extrair_leads()
+    extractor.extrair_eventos()
 
 
 if __name__ == "__main__":
