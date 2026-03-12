@@ -661,7 +661,203 @@ class KommoExtractor:
         Na ausência de checkpoint (primeira execução), faz um Full Load completo.
         O load é feito por conta individualmente para limitar o uso excessivo de memória
         """
+        logger.info("=== Iniciando extração: leads ===")
+        falhas = []
+        total_registros = 0
+
+        for conta in self.lista_clientes:
+            dados = self.clientes[conta]
+
+            #checkpoint incremental
+            checkpoint = self._get_checkpoint("leads", conta, "updated_at")
+            
+            filtro_data = ""
+            if checkpoint:
+                ts = int(dt.datetime.fromisoformat(checkpoint).timestamp())
+                filtro_data = f"&filter[updated_at][from]={ts}"
+                logger.info(f"[leads] {conta}: incremental a partir de {checkpoint}")
+            else:
+                logger.info(f"[leads] {conta}: sem checkpoint - full load inicial")
+
+            url_inicial = (
+                f"https://{dados['url']}.kommo.com/api/v4/leads"
+                f"?with=source_id,contacts,loss_reason"
+                f"&page=1&limit=250{filtro_data}"
+            )
+
+            registros_conta = []
         
+            try:
+                for pagina_leads, num_pagina in self._paginar(
+                    url_inicial, dados["access_token"], "leads"
+                ):
+                    for lead in pagina_leads:
+                        # Flatten: custom_field_values -> colunas escalares
+                        for field in lead.pop("custom_fields_values", []) or []:
+                            values = field.get("values", [])
+                            if values:
+                                lead[field["field_name"]] = values[0].get("value")
+                        
+                        # Flatten: _embedded -> tags_id, contacts_id
+                        embedded = lead.pop("_embedded", {}) or {}
+                        for key, values in embedded.items():
+                            if not isinstance(values, list) or not values:
+                                continue 
+
+                            if key == "tags":
+                                # Busca tag Comodo ([CO]) lógica preservada do original
+                                tag_comodo = next(
+                                    (
+                                        t for t in values 
+                                        if isinstance(t.get("name"), str)
+                                        and "[CO]" in t["name"]
+                                    ),
+                                    values[0], # fallback: primeira tag
+                                )
+                                lead["tags_id"] = tag_comodo.get("id")
+                                lead["tags_name"] = tag_comodo.get("name")
+                            else:
+                                lead[f"{key}_id"] = values[0].get("id")
+
+                        lead.pop("_links", None)
+                        lead["account_subdomain"] = conta
+                        lead["_ingestion_timestamp"] = (
+                            dt.datetime.now(dt.timezone.utc).isoformat()
+                        )
+                        registros_conta.append(lead)
+
+                    logger.info(
+                        f"[leads] {conta}: página {num_pagina}"
+                        f"{len(registros_conta)} lead(s) acumulado(s)"
+                    )
+
+                if registros_conta:
+                    df = pd.DataFrame(registros_conta)
+                    df = self.elt.prepare_dataframe_for_load(df)
+                    self.elt.load_to_bigquery_raw(
+                        dataframe=df,
+                        dataset_id=DATASET_RAW,
+                        table_id="leads",
+                        write_disposition="WRITE_APPEND"
+                    )
+
+                    total_registros += len(registros_conta)
+                    logger.info(
+                        f"[leads] {conta}: {len(registros_conta)} lead(s) carregado(s)"
+                    )
+
+                else: 
+                    logger.info(f"[leads] {conta}: sem novos leads desde {checkpoint}")
+                
+            except (ValueError, Exception) as e:
+                self._send_to_dlq(conta, "leads", [], str(e))
+                falhas.append(conta)
+
+        logger.info(
+            f"[leads] concluído: {total_registros} registro(s) | {len(falhas)} falha(s)."
+        )
+
+    
+    def extrair_eventos(self):
+        """
+        Extrai eventos com paginação e janela temporal por created_at
+        Destino: kommo_raw.eventos
+        Estratégia: WRITE_APPEND com janela fixa de 2 semanas
+
+        Eventos são imutáveis por natureza - um evento criado nunca muda
+        Por isso usamos o created_at como fronteira, não o updated_at
+
+        Não usamos checkpoint de MAX(created_at) intencionalmente:
+        eventos muito recentes podem chegar atrasados na API do kommo
+        então a janela fixa com WRITE_APPEND + deduplicação por SQL
+        posterior é mais segura do que um checkpoint estrito.
+
+        Flatten aplicado:
+        - value_before / value_after -> colunas *_before e *_after 
+        - _embedded -> entity_id, entity_name por tipo de entidade
+        """
+
+        logger.info("=== Iniciando extração: eventos ===")
+        falhas = []
+        total_registros = 0
+
+        agora = dt.datetime.now(dt.timezone.utc)
+        inicio_janela = agora - dt.timedelta(weeks=2)
+        ts_inicio = int(inicio_janela.timestamp())
+        ts_fim = int(agora.timestamp())
+
+        logger.info(
+            f"[evento] Janela: {inicio_janela.date()} -> {agora.date()}"
+        )
+
+        for conta in self.lista_clientes:
+            dados = self.clientes[conta]
+
+            url_inicial = (
+                f"https://{dados['url']}.kommo.com/api/v4/events"
+                f"?with=contact_name,lead_name,company_name"
+                f"&page=1&limit=100"
+                f"&filter[created_at][from]={ts_inicio}"
+                f"&filter[created_at][to]={ts_fim}"
+            )
+
+            registros_conta = []
+
+            try:
+                for pagina_enventos, num_pagina in self._paginar(
+                    url_inicial, dados["access_token"], "events"
+                ):
+                    for event in pagina_enventos:
+                        # Flatten: value_before -> colunas *_before
+                        value_before = event.pop("value_before", None) or []
+                        if value_before and isinstance(value_before, list):
+                            for k, v in value_before[0].items():
+                                event[f"{k}_before"] = v
+
+                        # Flatten: value_after -> coluna *_after
+                        value_after = event.pop("value_after", None) or []
+                        if value_after and isinstance(value_after, list):
+                            for k, v in value_after[0].items():
+                                event[f"{k}_after"] = v
+
+                        # Flatten: _embedded -> entity_id, entity_name
+                        embedded = event.pop("_embedded", {}) or {}
+                        for key, values in embedded.items():
+                            if isinstance(values, list) and values:
+                                event[f"{key}_id"] = values[0].get("id")
+                                event[f"{key}_name"] = values[0].get("name", "")
+
+                        event.pop("_links", None)
+                        event["account_subdomain"] = conta
+                        event["_ingestion_timestamp"] = (
+                            dt.datetime.now(dt.timezone.utc).isoformat()
+                        )
+                        registros_conta.append(event)
+
+                if registros_conta:
+                    df = pd.DataFrame(registros_conta)
+                    df = self.elt.prepare_dataframe_for_load(df)
+                    self.elt.load_to_bigquery_raw(
+                        dataframe=df,
+                        dataset_id=DATASET_RAW,
+                        table_id="eventos",
+                        write_disposition="WRITE_APPEND",
+                    )
+                    total_registros += len(registros_conta)
+                    logger.info(
+                        f"[events] {conta}: {len(registros_conta)} evento(s) carregado(s)"
+                    )
+
+                else: 
+                    logger.info(f"[eventos] {conta}: sem eventos na janela.")
+
+            except (ValueError, Exception) as e:
+                self._send_to_dlq(conta, "eventos", [], str(e))
+                falhas.append(conta)
+
+        logger.info(
+            f"[eventos] Concluído: {total_registros} registro(s) | {len(falhas)} falha(s)"
+        )
 
 
 def main():
