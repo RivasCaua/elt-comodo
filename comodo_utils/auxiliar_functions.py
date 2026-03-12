@@ -182,7 +182,7 @@ class ELTExecutor:
         """
         nfkd_form = unicodedata.normalize('NFKD', input_str)
         only_ascii = nfkd_form.encode('ASCII', 'ignore').decode('utf-8')
-        return re.sub(r'[^a-zA-Z0-9 ]', '', only_ascii)
+        return re.sub(r'[^a-zA-Z0-9_ ]', '', only_ascii)
 
     def rename_duplicate_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """

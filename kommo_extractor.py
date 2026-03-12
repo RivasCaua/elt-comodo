@@ -143,7 +143,7 @@ class KommoExtractor:
         try:
             df_dlq = pd.DataFrame([
                 {
-                    "ingestion_timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "_ingestion_timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
                     "account_subdomain": conta,
                     "entidade": entidade,
                     "error_message": str(error)[:1000],
@@ -182,6 +182,48 @@ class KommoExtractor:
     # Justificativa: são tabelas pequenas e estáveis. Re-escrita completa
     # é mais simples e segura do que controle incremental para estas.
     # ------------------------------------------------------------------
+
+    def _paginar(
+        self, 
+        url_inicial: str,
+        access_token: str,
+        embedded_key: str,
+    ):
+        """
+        Gerador que itera sobre páginas da API do kommo.
+        Busca uma página por vez via _links.next, liberando memória antes de carregar a próxima
+
+        :param url_inicial: URL da primeira página.
+        :param access_token: Token de autenticação.
+        :param embedded_key: Chave dentro da _embedded (ex: 'leads', 'tasks')
+        :yields: (registros, num_pagina)
+        :raises ValueError: Se a API retornar erro em qualquer página
+        """
+
+        url = url_inicial
+        num_pagina = 0
+
+        while url:
+            num_pagina += 1
+            resultado = self._authenticated_request(url, access_token)
+
+            if resultado is None:
+                break
+
+            if "error" in resultado:
+                raise  ValueError(
+                    f"Erro na página {num_pagina}: {resultado['error']}"
+                )
+            
+            registros = resultado.get("_embedded", {}).get(embedded_key, [])
+            yield registros, num_pagina
+
+            # Próxima páigna via _links.next - None encerra o loop
+            url = (
+                resultado.get("_links", {})
+                .get("next", {})
+                .get("href")
+            )
 
     def extrair_contas(self):
         """
@@ -876,7 +918,7 @@ def main():
     extractor.extrair_tarefas()
     extractor.extrair_leads()
     extractor.extrair_eventos()
-
+    
 
 if __name__ == "__main__":
     main()
