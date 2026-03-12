@@ -558,7 +558,7 @@ class KommoExtractor:
                 dataframe=df_e,
                 dataset_id=DATASET_RAW,
                 table_id="listas_elementos",
-                write_disposition="WRITE_TRINCATE",
+                write_disposition="WRITE_TRUNCATE",
             )
 
         logger.info(
@@ -615,7 +615,7 @@ class KommoExtractor:
                             for k, v in result.items():
                                 task[f"result_{k}"] = v 
                         
-                        task["account_sudbomain"] = conta
+                        task["account_subdomain"] = conta
                         task["_ingestion_timestamp"] = (
                             dt.datetime.now(dt.timezone.utc).isoformat()
                         )
@@ -727,7 +727,7 @@ class KommoExtractor:
                         registros_conta.append(lead)
 
                     logger.info(
-                        f"[leads] {conta}: página {num_pagina}"
+                        f"[leads] {conta}: página {num_pagina} - "
                         f"{len(registros_conta)} lead(s) acumulado(s)"
                     )
 
