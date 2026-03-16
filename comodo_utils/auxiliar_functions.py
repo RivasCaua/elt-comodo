@@ -71,15 +71,14 @@ class ELTExecutor:
     # LOAD — BIGQUERY ESCRITA (camada RAW)
     # ------------------------------------------------------------------
 
-    def ensure_dataset_exists(self, dataset_id : str, location : str = 'us-central1'):
+    def ensure_dataset_exists(self, dataset_id: str, location: str = 'us-central1'):
         '''
-        Garante que o dataset exista no Bigquery
-        se não existir, cria um novo com o nome que foi setado
+        Garante que o dataset exista no Bigquery.
+        Se não existir, cria um novo com o nome que foi setado.
 
-        :param dataset_id: Nome do dataset 
-        :param location: Localização do dataset 
+        :param dataset_id: Nome do dataset
+        :param location: Localização do dataset
         '''
-
         dataset_ref = f"{self.bigquery_client.project}.{dataset_id}"
         try:
             self.bigquery_client.get_dataset(dataset_ref)
@@ -89,7 +88,6 @@ class ELTExecutor:
             dataset.location = location
             self.bigquery_client.create_dataset(dataset)
             logger.info(f"Dataset Criado: {dataset_id}")
-
 
     def load_to_bigquery_raw(
         self,
@@ -105,6 +103,10 @@ class ELTExecutor:
         Segue o paradigma ELT: os dados chegam sem transformações de negócio.
         O envio é feito em chunks para evitar estouro de memória (OOM).
 
+        ALLOW_FIELD_ADDITION habilitado para suportar contas com campos
+        customizados diferentes — o BigQuery aceita novos campos automaticamente
+        sem rejeitar o load.
+
         :param dataframe: DataFrame com dados brutos extraídos da API.
         :param dataset_id: Nome do dataset RAW (ex: "kommo_raw").
         :param table_id: Nome da tabela (ex: "leads").
@@ -112,14 +114,19 @@ class ELTExecutor:
         :param write_disposition: WRITE_APPEND (acrescenta) ou WRITE_TRUNCATE (substitui).
         :param chunk_size: Quantidade de linhas por chunk (padrão: 10.000).
         """
-
         self.ensure_dataset_exists(dataset_id)
 
         full_table_path = f"{dataset_id}.{table_id}"
 
         job_config = bigquery.LoadJobConfig(
             write_disposition=write_disposition,
-            schema=schema if schema else []
+            schema=schema if schema else [],
+            # Permite adicionar novos campos automaticamente quando contas
+            # possuem campos customizados que outras não têm.
+            # Sem isso, o BQ rejeita qualquer load com colunas novas.
+            schema_update_options=[
+                bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
+            ],
         )
 
         try:
@@ -178,7 +185,7 @@ class ELTExecutor:
         Necessário para compatibilidade com nomes de colunas no BigQuery.
 
         :param input_str: String original.
-        :return: String sem acentos e caracteres especiais.
+        :return: String sem acentos e caracteres especiais (underscore preservado).
         """
         nfkd_form = unicodedata.normalize('NFKD', input_str)
         only_ascii = nfkd_form.encode('ASCII', 'ignore').decode('utf-8')
@@ -231,10 +238,9 @@ class ELTExecutor:
             f"DataFrame preparado para load: {len(df)} registros, {len(df.columns)} colunas."
         )
         return df
-    
-    
+
     # ------------------------------------------------------------------
-    # PREPARAÇÃO TÉCNICA PARA LOAD — não são transformações de negócio
+    # UTILITÁRIOS DE DATA
     # ------------------------------------------------------------------
 
     def data_milissegundos(self, day: int) -> int:
@@ -245,7 +251,6 @@ class ELTExecutor:
         :param day: Número de dias a subtrair da data atual.
         :return: Timestamp em milissegundos.
         """
-
         data_anterior = dt.datetime.now() - dt.timedelta(days=day)
         timestamp_ms = int(data_anterior.timestamp() * 1000)
         logger.info(f"Timestamp calculado: {data_anterior.strftime('%Y-%m-%d')} → {timestamp_ms}ms")

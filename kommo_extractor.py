@@ -30,6 +30,10 @@ class KommoExtractor:
     - DLQ: registros com falha são isolados em kommo_raw.dlq para
       auditoria e reprocessamento, sem derrubar o pipeline.
     - Multi-tenant: itera sobre todas as contas do clientes.json.
+    - Renovação de token sob demanda: só renova quando recebe 401 durante
+      a extração, sem chamar renovar_chaves() em massa antes de tudo.
+      Tokens Kommo podem ter validade de anos — renovação prévia é desnecessária
+      e causava falsos erros para contas com refresh_token expirado.
     """
 
     def __init__(self):
@@ -47,7 +51,7 @@ class KommoExtractor:
     def _authenticated_request(
         self,
         url: str,
-        access_token: str,
+        conta: str,
         max_retries: int = MAX_RETRIES,
         retry_delay: int = RETRY_DELAY,
     ) -> Optional[dict]:
@@ -55,12 +59,22 @@ class KommoExtractor:
         Executa uma requisição GET autenticada com retry automático e
         backoff linear.
 
+        Renovação de token sob demanda: se receber 401, tenta renovar o
+        access_token via refresh_token antes de desistir. Se a renovação
+        funcionar, refaz a requisição com o novo token. Se não funcionar,
+        retorna erro — o token pode ter expirado definitivamente.
+
+        :param url: URL da requisição.
+        :param conta: Nome da conta (usado para renovação de token).
         :return: dict com a resposta | None se 204 | dict com 'error' em
                  falha persistente.
         """
-        headers = {"Authorization": f"Bearer {access_token}"}
+        token_renovado = False
 
         for attempt in range(1, max_retries + 1):
+            access_token = self.clientes[conta]['access_token']
+            headers = {"Authorization": f"Bearer {access_token}"}
+
             try:
                 response = requests.get(url, headers=headers, timeout=30)
 
@@ -70,22 +84,34 @@ class KommoExtractor:
                 if response.status_code == 204:
                     return None
 
+                # 401 — tenta renovar o token uma única vez
+                if response.status_code == 401 and not token_renovado:
+                    logger.warning(
+                        f"[{conta}] 401 recebido — tentando renovar token..."
+                    )
+                    self.clientes[conta] = KommoUtils.renovar_chave_individual(
+                        conta, self.clientes[conta]
+                    )
+                    token_renovado = True
+                    # Não conta como tentativa — refaz imediatamente
+                    continue
+
                 logger.warning(
-                    f"Tentativa {attempt}/{max_retries} — "
+                    f"[{conta}] Tentativa {attempt}/{max_retries} — "
                     f"Status {response.status_code}: {response.text[:200]}"
                 )
 
-                # Erros 4xx não têm recuperação via retry
+                # Erros 4xx (exceto 401 já tratado) não têm recuperação via retry
                 if 400 <= response.status_code < 500:
                     return {"error": f"{response.status_code} - {response.reason}"}
 
                 time.sleep(retry_delay)
 
             except Exception as e:
-                logger.warning(f"Tentativa {attempt}/{max_retries} falhou: {e}")
+                logger.warning(f"[{conta}] Tentativa {attempt}/{max_retries} falhou: {e}")
                 time.sleep(retry_delay)
 
-        return {"error": f"Falha após {max_retries} tentativas — {url}"}
+        return {"error": f"[{conta}] Falha após {max_retries} tentativas — {url}"}
 
     def _get_checkpoint(
         self,
@@ -98,7 +124,7 @@ class KommoExtractor:
         para uma conta específica. Usado para filtrar apenas registros
         novos/alterados desde a última execução.
 
-        :return: String com a última data (ISO) | None se tabela não existe
+        :return: String com o último timestamp | None se tabela não existe
                  ou não há registros para a conta.
         """
         sql = f"""
@@ -132,14 +158,12 @@ class KommoExtractor:
         O pipeline principal nunca é interrompido por causa de um registro
         problemático — ele é quarentenado aqui para auditoria e
         reprocessamento posterior.
-
-        :param conta: Subdomain da conta Kommo.
-        :param entidade: Nome da entidade (ex: 'leads', 'eventos').
-        :param records: Lista de registros que falharam.
-        :param error: Mensagem de erro associada.
         """
+        # Garante que sempre há pelo menos um registro na DLQ
+        # mesmo quando o erro ocorre antes de qualquer dado ser extraído
         if not records:
-            return
+            records = [{"conta": conta, "entidade": entidade}]
+
         try:
             df_dlq = pd.DataFrame([
                 {
@@ -166,64 +190,59 @@ class KommoExtractor:
 
     def _add_metadata(self, df: pd.DataFrame, conta: str) -> pd.DataFrame:
         """
-        Adiciona colunas de rastreabilidade ao DataFrame bruto antes do
-        load. Permite auditoria de ingestão e suporte ao incremental.
-
-        Colunas adicionadas:
-        - account_subdomain: identifica a conta de origem (multi-tenant)
-        - _ingestion_timestamp: momento exato do carregamento no BQ
+        Adiciona colunas de rastreabilidade ao DataFrame bruto antes do load.
         """
         df["account_subdomain"] = conta
         df["_ingestion_timestamp"] = dt.datetime.now(dt.timezone.utc).isoformat()
         return df
+
+    def _paginar(
+        self,
+        url_inicial: str,
+        conta: str,
+        embedded_key: str,
+    ):
+        """
+        Gerador que itera sobre páginas da API do Kommo.
+        Busca uma página por vez via _links.next, liberando memória
+        antes de carregar a próxima.
+
+        :param url_inicial: URL da primeira página.
+        :param conta: Nome da conta (usado para autenticação e renovação de token).
+        :param embedded_key: Chave dentro de _embedded (ex: 'leads', 'tasks').
+        :yields: (registros, num_pagina)
+        :raises ValueError: Se a API retornar erro em qualquer página.
+        """
+        url = url_inicial
+        num_pagina = 0
+
+        while url:
+            num_pagina += 1
+            resultado = self._authenticated_request(url, conta)
+
+            if resultado is None:
+                break
+
+            if "error" in resultado:
+                raise ValueError(
+                    f"Erro na página {num_pagina}: {resultado['error']}"
+                )
+
+            registros = resultado.get("_embedded", {}).get(embedded_key, [])
+            yield registros, num_pagina
+
+            # Próxima página via _links.next — None encerra o loop
+            url = (
+                resultado.get("_links", {})
+                .get("next", {})
+                .get("href")
+            )
 
     # ------------------------------------------------------------------
     # DIMENSÕES — estratégia WRITE_TRUNCATE (sem incremental)
     # Justificativa: são tabelas pequenas e estáveis. Re-escrita completa
     # é mais simples e segura do que controle incremental para estas.
     # ------------------------------------------------------------------
-
-    def _paginar(
-        self, 
-        url_inicial: str,
-        access_token: str,
-        embedded_key: str,
-    ):
-        """
-        Gerador que itera sobre páginas da API do kommo.
-        Busca uma página por vez via _links.next, liberando memória antes de carregar a próxima
-
-        :param url_inicial: URL da primeira página.
-        :param access_token: Token de autenticação.
-        :param embedded_key: Chave dentro da _embedded (ex: 'leads', 'tasks')
-        :yields: (registros, num_pagina)
-        :raises ValueError: Se a API retornar erro em qualquer página
-        """
-
-        url = url_inicial
-        num_pagina = 0
-
-        while url:
-            num_pagina += 1
-            resultado = self._authenticated_request(url, access_token)
-
-            if resultado is None:
-                break
-
-            if "error" in resultado:
-                raise  ValueError(
-                    f"Erro na página {num_pagina}: {resultado['error']}"
-                )
-            
-            registros = resultado.get("_embedded", {}).get(embedded_key, [])
-            yield registros, num_pagina
-
-            # Próxima páigna via _links.next - None encerra o loop
-            url = (
-                resultado.get("_links", {})
-                .get("next", {})
-                .get("href")
-            )
 
     def extrair_contas(self):
         """
@@ -237,10 +256,8 @@ class KommoExtractor:
 
         for conta in self.lista_clientes:
             dados = self.clientes[conta]
-            url = (
-                f"https://{dados['url']}.kommo.com/api/v4/account?with=amojo_id"
-            )
-            resultado = self._authenticated_request(url, dados["access_token"])
+            url = f"https://{dados['url']}.kommo.com/api/v4/account?with=amojo_id"
+            resultado = self._authenticated_request(url, conta)
 
             if resultado is None:
                 logger.warning(f"[contas] {conta}: 204 No Content — pulando.")
@@ -253,7 +270,6 @@ class KommoExtractor:
                 continue
 
             try:
-                # Mantém apenas campos escalares — sem dicts/lists aninhados
                 row = {
                     k: v
                     for k, v in resultado.items()
@@ -298,7 +314,7 @@ class KommoExtractor:
                 f"https://{dados['url']}.kommo.com/api/v4/leads/tags"
                 "?page=1&limit=250"
             )
-            resultado = self._authenticated_request(url, dados["access_token"])
+            resultado = self._authenticated_request(url, conta)
 
             if resultado is None:
                 logger.info(f"[tags] {conta}: sem tags (204).")
@@ -352,7 +368,7 @@ class KommoExtractor:
                 f"https://{dados['url']}.kommo.com/api/v4/users"
                 "?with=role,group&page=1&limit=250"
             )
-            resultado = self._authenticated_request(url, dados["access_token"])
+            resultado = self._authenticated_request(url, conta)
 
             if resultado is None:
                 logger.info(f"[usuarios] {conta}: 204 No Content.")
@@ -366,7 +382,6 @@ class KommoExtractor:
             try:
                 users = resultado.get("_embedded", {}).get("users", [])
                 for user in users:
-                    # Flatten _embedded: { roles: [{id, name}], groups: [...] }
                     embedded = user.pop("_embedded", {}) or {}
                     for key, values in embedded.items():
                         if isinstance(values, list) and values:
@@ -402,8 +417,6 @@ class KommoExtractor:
         Extrai pipelines e seus statuses por conta em uma única chamada de API.
         Destino  : kommo_raw.pipelines | kommo_raw.statuses
         Estratégia: WRITE_TRUNCATE para ambas.
-        Flatten  : statuses extraídos do _embedded de cada pipeline,
-                   mantendo a referência pipeline_id.
         """
         logger.info("=== Iniciando extração: pipelines e statuses ===")
         pipelines_registros = []
@@ -416,7 +429,7 @@ class KommoExtractor:
                 f"https://{dados['url']}.kommo.com/api/v4/leads/pipelines"
                 "?limit=249"
             )
-            resultado = self._authenticated_request(url, dados["access_token"])
+            resultado = self._authenticated_request(url, conta)
 
             if resultado is None:
                 logger.info(f"[pipelines] {conta}: 204 No Content.")
@@ -433,12 +446,9 @@ class KommoExtractor:
 
                 for pipeline in pipelines:
                     pipeline_id = pipeline.get("id")
-
-                    # Extrai statuses antes de remover o _embedded do pipeline
                     embedded_statuses = (
                         pipeline.pop("_embedded", {}).get("statuses", [])
                     )
-
                     pipeline["account_subdomain"] = conta
                     pipeline["_ingestion_timestamp"] = (
                         dt.datetime.now(dt.timezone.utc).isoformat()
@@ -446,7 +456,6 @@ class KommoExtractor:
                     pipelines_registros.append(pipeline)
 
                     for status in embedded_statuses:
-                        # Remove links desnecessários no raw
                         status.pop("_links", None)
                         status["pipeline_id"] = pipeline_id
                         status["account_subdomain"] = conta
@@ -496,19 +505,10 @@ class KommoExtractor:
 
     def extrair_listas(self):
         """
-        Extrai catálogos (listas) e seus elementos por conta
+        Extrai catálogos (listas) e seus elementos por conta.
         Destino: kommo_raw.listas | kommo_raw.listas_elementos
         Estratégia: WRITE_TRUNCATE - volume controlado, estrutura estável.
-
-        A extração é em dois níveis:
-        1. Catalogs: Lista de catálogos da conta
-        2. Elements: para cada catálogo, busca seus elementos com paginação
-
-        Flatten: custom_fields_values dos elementos são promovidos a colunas
-        escalares diretamente no raw, preservando o field_name como nome da 
-        coluna
         """
-
         logger.info("=== Iniciando extração: listas ===")
         listas_registros = []
         elementos_registros = []
@@ -520,16 +520,16 @@ class KommoExtractor:
                 f"https://{dados['url']}.kommo.com/api/v4/catalogs"
                 "?page=1&limit=249"
             )
-            resultado = self._authenticated_request(url_catalogs, dados["access_token"])
+            resultado = self._authenticated_request(url_catalogs, conta)
 
             if resultado is None:
                 logger.info(f"[listas] {conta}: sem catálogos (204)")
-                continue 
+                continue
 
             if "error" in resultado:
                 self._send_to_dlq(conta, "listas", [resultado], resultado["error"])
                 falhas.append(conta)
-                continue 
+                continue
 
             try:
                 catalogs = resultado.get("_embedded", {}).get("catalogs", [])
@@ -544,7 +544,6 @@ class KommoExtractor:
                     )
                     listas_registros.append(catalog)
 
-                    # busca elementos do catálogo com paginação
                     url_elements = (
                         f"https://{dados['url']}.kommo.com/api/v4"
                         f"/catalogs/{catalog_id}/elements?page=1&limit=249"
@@ -552,16 +551,15 @@ class KommoExtractor:
 
                     try:
                         for pagina_elementos, num_pagina in self._paginar(
-                            url_elements, dados["access_token"], "elements"
+                            url_elements, conta, "elements"
                         ):
                             for element in pagina_elementos:
-                                # Flatten: custom_fields_values -> colunas escalares
                                 for field in element.pop("custom_fields_values", []) or []:
                                     values = field.get("values", [])
                                     if values:
                                         element[field["field_name"]] = values[0].get("value")
 
-                                element["catalog_id"] = catalog_id 
+                                element["catalog_id"] = catalog_id
                                 element["catalog_name"] = catalog_name
                                 element["account_subdomain"] = conta
                                 element["_ingestion_timestamp"] = (
@@ -575,9 +573,7 @@ class KommoExtractor:
                             [{"catalog_id": catalog_id}], str(e)
                         )
 
-                logger.info(
-                    f"[listas] {conta}: {len(catalogs)} catálogo(s) OK"
-                )
+                logger.info(f"[listas] {conta}: {len(catalogs)} catálogo(s) OK")
 
             except Exception as e:
                 self._send_to_dlq(conta, "listas", [resultado], str(e))
@@ -604,35 +600,27 @@ class KommoExtractor:
             )
 
         logger.info(
-            f"[listas] Concluído: {len(listas_registros)} lista(s)"
+            f"[listas] Concluído: {len(listas_registros)} lista(s), "
             f"{len(elementos_registros)} elemento(s) | {len(falhas)} falha(s)"
         )
 
-    
     def extrair_tarefas(self):
         """
         Extrai tarefas com paginação e extração incremental por updated_at.
         Destino: kommo_raw.tarefas
-        Estratégia: WRITE_APPEND incremental - só puxa tarefas criadas ou alteradas desde o último checkpoint registrado no BQ
-
-        Flatten: o campo 'result' (dicionário) é promovido a colunas escalarem com prefixo 'result_' para evitar campos aninhados no raw
-
-        Na ausência de checkpoing (primeira execução), faz full load
+        Estratégia: WRITE_APPEND incremental.
         """
-
         logger.info("=== Iniciando extração: tarefas ===")
         falhas = []
         total_registros = 0
 
         for conta in self.lista_clientes:
             dados = self.clientes[conta]
-
-            # Checkpoint incremental: busca a última updated_at registrada
             checkpoint = self._get_checkpoint("tarefas", conta, "updated_at")
 
             filtro_data = ""
             if checkpoint:
-                ts = int(dt.datetime.fromisoformat(checkpoint).timestamp())
+                ts = int(float(checkpoint))
                 filtro_data = f"&filter[updated_at][from]={ts}"
                 logger.info(f"[tarefas] {conta}: incremental a partir de {checkpoint}")
             else:
@@ -643,28 +631,26 @@ class KommoExtractor:
                 f"?page=1&limit=249{filtro_data}"
             )
 
-            registros_contas = []
+            registros_conta = []
 
             try:
-                for pagina_tarefas, num_paginas in self._paginar(
-                    url_inicial, dados["access_token"], "tasks"
+                for pagina_tarefas, num_pagina in self._paginar(
+                    url_inicial, conta, "tasks"
                 ):
-                    
                     for task in pagina_tarefas:
-                        # Flatten: result dict -> colunas result_*
                         result = task.pop("result", None) or {}
                         if isinstance(result, dict):
                             for k, v in result.items():
-                                task[f"result_{k}"] = v 
-                        
+                                task[f"result_{k}"] = v
+
                         task["account_subdomain"] = conta
                         task["_ingestion_timestamp"] = (
                             dt.datetime.now(dt.timezone.utc).isoformat()
                         )
-                        registros_contas.append(task)
-                
-                if registros_contas:
-                    df = pd.DataFrame(registros_contas)
+                        registros_conta.append(task)
+
+                if registros_conta:
+                    df = pd.DataFrame(registros_conta)
                     df = self.elt.prepare_dataframe_for_load(df)
                     self.elt.load_to_bigquery_raw(
                         dataframe=df,
@@ -672,15 +658,15 @@ class KommoExtractor:
                         table_id="tarefas",
                         write_disposition="WRITE_APPEND",
                     )
-                    total_registros += len(registros_contas)
+                    total_registros += len(registros_conta)
                     logger.info(
-                        f"[tarefas] {conta}: {len(registros_contas)} tarefa(s) carregada(s)"
+                        f"[tarefas] {conta}: {len(registros_conta)} tarefa(s) carregada(s)"
                     )
-
-                else: 
+                else:
                     logger.info(f"[tarefas] {conta}: sem novas tarefas desde {checkpoint}")
 
             except (ValueError, Exception) as e:
+                logger.error(f"[tarefas] {conta}: {e}")
                 self._send_to_dlq(conta, "tarefas", [], str(e))
                 falhas.append(conta)
 
@@ -688,20 +674,15 @@ class KommoExtractor:
             f"[tarefas] Concluído: {total_registros} registro(s) | {len(falhas)} falha(s)."
         )
 
-
     def extrair_leads(self):
         """
         Extrai leads com paginação e extração incremental por updated_at.
         Destino: kommo_raw.leads
-        Estratégia: WRITE_APPEND incremental - resolve o OOM ao eliminar o Full Load que causava o crash da VM
+        Estratégia: WRITE_APPEND incremental.
 
-        Flatten aplicado no raw:
-        - custom_fields_values -> colunas escalares pelo field_name
-        - _embedded.tags -> tags_id / tags_name (tag Comodo identificada pelo prefixo [CO], preservando lógica original)
-        - _embedded.contacts -> contracts_id
-
-        Na ausência de checkpoint (primeira execução), faz um Full Load completo.
-        O load é feito por conta individualmente para limitar o uso excessivo de memória
+        Deleções são rastreadas via tabela de eventos (tipo 'lead_deleted'),
+        não pelo campo is_deleted — a API do Kommo não retorna leads deletados
+        no endpoint de listagem, independente do parâmetro with=is_deleted.
         """
         logger.info("=== Iniciando extração: leads ===")
         falhas = []
@@ -709,13 +690,11 @@ class KommoExtractor:
 
         for conta in self.lista_clientes:
             dados = self.clientes[conta]
-
-            #checkpoint incremental
             checkpoint = self._get_checkpoint("leads", conta, "updated_at")
-            
+
             filtro_data = ""
             if checkpoint:
-                ts = int(dt.datetime.fromisoformat(checkpoint).timestamp())
+                ts = int(float(checkpoint))
                 filtro_data = f"&filter[updated_at][from]={ts}"
                 logger.info(f"[leads] {conta}: incremental a partir de {checkpoint}")
             else:
@@ -728,33 +707,30 @@ class KommoExtractor:
             )
 
             registros_conta = []
-        
+
             try:
                 for pagina_leads, num_pagina in self._paginar(
-                    url_inicial, dados["access_token"], "leads"
+                    url_inicial, conta, "leads"
                 ):
                     for lead in pagina_leads:
-                        # Flatten: custom_field_values -> colunas escalares
                         for field in lead.pop("custom_fields_values", []) or []:
                             values = field.get("values", [])
                             if values:
                                 lead[field["field_name"]] = values[0].get("value")
-                        
-                        # Flatten: _embedded -> tags_id, contacts_id
+
                         embedded = lead.pop("_embedded", {}) or {}
                         for key, values in embedded.items():
                             if not isinstance(values, list) or not values:
-                                continue 
+                                continue
 
                             if key == "tags":
-                                # Busca tag Comodo ([CO]) lógica preservada do original
                                 tag_comodo = next(
                                     (
-                                        t for t in values 
+                                        t for t in values
                                         if isinstance(t.get("name"), str)
                                         and "[CO]" in t["name"]
                                     ),
-                                    values[0], # fallback: primeira tag
+                                    values[0],
                                 )
                                 lead["tags_id"] = tag_comodo.get("id")
                                 lead["tags_name"] = tag_comodo.get("name")
@@ -780,45 +756,39 @@ class KommoExtractor:
                         dataframe=df,
                         dataset_id=DATASET_RAW,
                         table_id="leads",
-                        write_disposition="WRITE_APPEND"
+                        write_disposition="WRITE_APPEND",
                     )
-
                     total_registros += len(registros_conta)
                     logger.info(
                         f"[leads] {conta}: {len(registros_conta)} lead(s) carregado(s)"
                     )
-
-                else: 
+                else:
                     logger.info(f"[leads] {conta}: sem novos leads desde {checkpoint}")
-                
+
             except (ValueError, Exception) as e:
+                logger.error(f"[leads] {conta}: {e}")
                 self._send_to_dlq(conta, "leads", [], str(e))
                 falhas.append(conta)
 
         logger.info(
-            f"[leads] concluído: {total_registros} registro(s) | {len(falhas)} falha(s)."
+            f"[leads] Concluído: {total_registros} registro(s) | {len(falhas)} falha(s)."
         )
 
-    
     def extrair_eventos(self):
         """
-        Extrai eventos com paginação e janela temporal por created_at
+        Extrai eventos com paginação e janela temporal por created_at.
         Destino: kommo_raw.eventos
-        Estratégia: WRITE_APPEND com janela fixa de 2 semanas
+        Estratégia: WRITE_APPEND com janela fixa de 2 semanas.
 
-        Eventos são imutáveis por natureza - um evento criado nunca muda
-        Por isso usamos o created_at como fronteira, não o updated_at
+        Eventos são imutáveis — a janela fixa com deduplicação SQL posterior
+        é mais segura do que checkpoint estrito, pois eventos recentes podem
+        chegar atrasados na API do Kommo.
 
-        Não usamos checkpoint de MAX(created_at) intencionalmente:
-        eventos muito recentes podem chegar atrasados na API do kommo
-        então a janela fixa com WRITE_APPEND + deduplicação por SQL
-        posterior é mais segura do que um checkpoint estrito.
-
-        Flatten aplicado:
-        - value_before / value_after -> colunas *_before e *_after 
-        - _embedded -> entity_id, entity_name por tipo de entidade
+        Também é a fonte de verdade para deleções de leads:
+        eventos do tipo 'lead_deleted' são usados pela view SQL para
+        excluir leads deletados sem depender do campo is_deleted.
         """
-
+        
         logger.info("=== Iniciando extração: eventos ===")
         falhas = []
         total_registros = 0
@@ -829,12 +799,11 @@ class KommoExtractor:
         ts_fim = int(agora.timestamp())
 
         logger.info(
-            f"[evento] Janela: {inicio_janela.date()} -> {agora.date()}"
+            f"[eventos] Janela: {inicio_janela.date()} -> {agora.date()}"
         )
 
         for conta in self.lista_clientes:
             dados = self.clientes[conta]
-
             url_inicial = (
                 f"https://{dados['url']}.kommo.com/api/v4/events"
                 f"?with=contact_name,lead_name,company_name"
@@ -846,23 +815,20 @@ class KommoExtractor:
             registros_conta = []
 
             try:
-                for pagina_enventos, num_pagina in self._paginar(
-                    url_inicial, dados["access_token"], "events"
+                for pagina_eventos, num_pagina in self._paginar(
+                    url_inicial, conta, "events"
                 ):
-                    for event in pagina_enventos:
-                        # Flatten: value_before -> colunas *_before
+                    for event in pagina_eventos:
                         value_before = event.pop("value_before", None) or []
                         if value_before and isinstance(value_before, list):
                             for k, v in value_before[0].items():
                                 event[f"{k}_before"] = v
 
-                        # Flatten: value_after -> coluna *_after
                         value_after = event.pop("value_after", None) or []
                         if value_after and isinstance(value_after, list):
                             for k, v in value_after[0].items():
                                 event[f"{k}_after"] = v
 
-                        # Flatten: _embedded -> entity_id, entity_name
                         embedded = event.pop("_embedded", {}) or {}
                         for key, values in embedded.items():
                             if isinstance(values, list) and values:
@@ -887,13 +853,13 @@ class KommoExtractor:
                     )
                     total_registros += len(registros_conta)
                     logger.info(
-                        f"[events] {conta}: {len(registros_conta)} evento(s) carregado(s)"
+                        f"[eventos] {conta}: {len(registros_conta)} evento(s) carregado(s)"
                     )
-
-                else: 
+                else:
                     logger.info(f"[eventos] {conta}: sem eventos na janela.")
 
             except (ValueError, Exception) as e:
+                logger.error(f"[eventos] {conta}: {e}")
                 self._send_to_dlq(conta, "eventos", [], str(e))
                 falhas.append(conta)
 
@@ -903,8 +869,9 @@ class KommoExtractor:
 
 
 def main():
-    KommoUtils.renovar_chaves()
-
+    # Sem renovar_chaves() em massa — tokens Kommo têm validade longa.
+    # Renovação acontece sob demanda no _authenticated_request()
+    # quando uma conta específica retorna 401 durante a extração.
     extractor = KommoExtractor()
 
     # Dimensões - WRITE_TRUNCATE, sem incremental
@@ -918,7 +885,7 @@ def main():
     extractor.extrair_tarefas()
     extractor.extrair_leads()
     extractor.extrair_eventos()
-    
+
 
 if __name__ == "__main__":
     main()
