@@ -121,12 +121,12 @@ class ELTExecutor:
         job_config = bigquery.LoadJobConfig(
             write_disposition=write_disposition,
             schema=schema if schema else [],
-            # Permite adicionar novos campos automaticamente quando contas
-            # possuem campos customizados que outras não têm.
-            # Sem isso, o BQ rejeita qualquer load com colunas novas.
-            schema_update_options=[
-                bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
-            ],
+            # ALLOW_FIELD_ADDITION só é válido com WRITE_APPEND
+            schema_update_options=(
+                [bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION]
+                if write_disposition == bigquery.WriteDisposition.WRITE_APPEND
+                else []
+            ),
         )
 
         try:
