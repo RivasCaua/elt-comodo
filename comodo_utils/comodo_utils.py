@@ -2,7 +2,6 @@ import os
 import logging
 import smtplib
 from email import encoders
-from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -37,7 +36,6 @@ class ComodoUtils:
                 "Variável GOOGLE_APPLICATION_CREDENTIALS não encontrada no .env"
             )
         
-        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = credencial
         logger.info("Storage Client criado com sucesso")
         return storage.Client()
     

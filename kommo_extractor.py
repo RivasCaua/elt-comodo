@@ -5,6 +5,8 @@ from typing import Optional
 
 import pandas as pd
 import requests
+import json
+from google.cloud import bigquery
 
 from comodo_utils.auxiliar_functions import ELTExecutor
 from kommo_crm.kommo_utils import KommoUtils
@@ -15,6 +17,8 @@ MAX_RETRIES = 3
 RETRY_DELAY = 20
 DATASET_RAW = "kommo_raw"
 DLQ_TABLE = "dlq"
+
+_SEP = "=" * 60
 
 
 class KommoExtractor:
@@ -130,10 +134,15 @@ class KommoExtractor:
         sql = f"""
             SELECT MAX({date_column}) AS last_update
             FROM `{self.elt.bigquery_client.project}.{DATASET_RAW}.{table_id}`
-            WHERE account_subdomain = '{conta}'
+            WHERE account_subdomain = @conta
         """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("conta", "STRING", conta)
+            ]
+        )
         try:
-            df = self.elt.query_bigquery(sql, table_id)
+            df = self.elt.query_bigquery(sql, table_id, job_config=job_config)
             val = df["last_update"].iloc[0]
             if pd.isnull(val):
                 return None
@@ -250,7 +259,9 @@ class KommoExtractor:
         Destino  : kommo_raw.contas
         Estratégia: WRITE_TRUNCATE — dimensão pequena, 1 registro por conta.
         """
-        logger.info("=== Iniciando extração: contas ===")
+        logger.info(_SEP)
+        logger.info("  EXTRAÇÃO: CONTAS")
+        logger.info(_SEP)
         registros = []
         falhas = []
 
@@ -297,6 +308,7 @@ class KommoExtractor:
         logger.info(
             f"[contas] Concluído: {len(registros)} ok | {len(falhas)} falha(s)."
         )
+        logger.info(_SEP)
 
     def extrair_tags(self):
         """
@@ -304,7 +316,9 @@ class KommoExtractor:
         Destino  : kommo_raw.tags
         Estratégia: WRITE_TRUNCATE — tags mudam pouco e o volume é baixo.
         """
-        logger.info("=== Iniciando extração: tags ===")
+        logger.info(_SEP)
+        logger.info("  EXTRAÇÃO: TAGS")
+        logger.info(_SEP)
         registros = []
         falhas = []
 
@@ -350,6 +364,7 @@ class KommoExtractor:
         logger.info(
             f"[tags] Concluído: {len(registros)} registro(s) | {len(falhas)} falha(s)."
         )
+        logger.info(_SEP)
 
     def extrair_usuarios(self):
         """
@@ -358,7 +373,9 @@ class KommoExtractor:
         Estratégia: WRITE_TRUNCATE
         Flatten  : _embedded (roles/groups) → colunas escalares no raw.
         """
-        logger.info("=== Iniciando extração: usuários ===")
+        logger.info(_SEP)
+        logger.info("  EXTRAÇÃO: USUÁRIOS")
+        logger.info(_SEP)
         registros = []
         falhas = []
 
@@ -382,11 +399,23 @@ class KommoExtractor:
             try:
                 users = resultado.get("_embedded", {}).get("users", [])
                 for user in users:
-                    embedded = user.pop("_embedded", {}) or {}
+                    # 1. Troca pop por get para não destruir o JSON
+                    embedded = user.get("_embedded", {}) or {}
                     for key, values in embedded.items():
                         if isinstance(values, list) and values:
                             user[f"{key}_id"] = values[0].get("id")
                             user[f"{key}_name"] = values[0].get("name", "")
+                    
+                    # 2. Serializa o _embedded para STRING (Igual você fez nas outras!)
+                    emb = user.get("_embedded")
+                    user["_embedded"] = json.dumps(emb, ensure_ascii=False) if emb else None
+
+                    # Transforma em string Python padrão, preservando a ordem original da API!
+                    if "rights" in user:
+                        user["rights"] = str(user["rights"]) if user["rights"] is not None else None
+                    if "_links" in user:
+                        user["_links"] = str(user["_links"]) if user["_links"] is not None else None
+                    # ----------------------------------
 
                     user["account_subdomain"] = conta
                     user["_ingestion_timestamp"] = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -411,6 +440,7 @@ class KommoExtractor:
         logger.info(
             f"[usuarios] Concluído: {len(registros)} registro(s) | {len(falhas)} falha(s)."
         )
+        logger.info(_SEP)
 
     def extrair_pipelines_e_statuses(self):
         """
@@ -418,7 +448,9 @@ class KommoExtractor:
         Destino  : kommo_raw.pipelines | kommo_raw.statuses
         Estratégia: WRITE_TRUNCATE para ambas.
         """
-        logger.info("=== Iniciando extração: pipelines e statuses ===")
+        logger.info(_SEP)
+        logger.info("  EXTRAÇÃO: PIPELINES E STATUSES")
+        logger.info(_SEP)
         pipelines_registros = []
         statuses_registros = []
         falhas = []
@@ -498,6 +530,7 @@ class KommoExtractor:
             f"[pipelines/statuses] Concluído: {len(pipelines_registros)} pipeline(s), "
             f"{len(statuses_registros)} status(es) | {len(falhas)} falha(s)."
         )
+        logger.info(_SEP)
 
     # ------------------------------------------------------------------
     # FATOS — estratégia incremental + paginação via _paginar()
@@ -509,11 +542,13 @@ class KommoExtractor:
         Destino: kommo_raw.listas | kommo_raw.listas_elementos
         Estratégia: WRITE_TRUNCATE - volume controlado, estrutura estável.
         """
-        logger.info("=== Iniciando extração: listas ===")
+        logger.info(_SEP)
+        logger.info("  EXTRAÇÃO: LISTAS")
+        logger.info(_SEP)
         listas_registros = []
         elementos_registros = []
         falhas = []
-
+ 
         for conta in self.lista_clientes:
             dados = self.clientes[conta]
             url_catalogs = (
@@ -521,44 +556,60 @@ class KommoExtractor:
                 "?page=1&limit=249"
             )
             resultado = self._authenticated_request(url_catalogs, conta)
-
+ 
             if resultado is None:
                 logger.info(f"[listas] {conta}: sem catálogos (204)")
                 continue
-
+ 
             if "error" in resultado:
                 self._send_to_dlq(conta, "listas", [resultado], resultado["error"])
                 falhas.append(conta)
                 continue
-
+ 
             try:
                 catalogs = resultado.get("_embedded", {}).get("catalogs", [])
-
+ 
                 for catalog in catalogs:
                     catalog_id = catalog.get("id")
                     catalog_name = catalog.get("name", str(catalog_id))
-
+ 
                     catalog["account_subdomain"] = conta
                     catalog["_ingestion_timestamp"] = (
                         dt.datetime.now(dt.timezone.utc).isoformat()
                     )
                     listas_registros.append(catalog)
-
+ 
                     url_elements = (
                         f"https://{dados['url']}.kommo.com/api/v4"
                         f"/catalogs/{catalog_id}/elements?page=1&limit=249"
                     )
-
+ 
                     try:
                         for pagina_elementos, num_pagina in self._paginar(
                             url_elements, conta, "elements"
                         ):
                             for element in pagina_elementos:
-                                for field in element.pop("custom_fields_values", []) or []:
+                                # Extrai valores flattened dos custom fields
+                                for field in element.get("custom_fields_values", []) or []:
                                     values = field.get("values", [])
                                     if values:
                                         element[field["field_name"]] = values[0].get("value")
-
+ 
+                                # Serializa colunas aninhadas para STRING
+                                # Garante idempotência com schema existente no BI
+                                cfv = element.get("custom_fields_values")
+                                element["custom_fields_values"] = (
+                                    json.dumps(cfv, ensure_ascii=False) if cfv else None
+                                )
+                                links = element.get("_links")
+                                element["_links"] = (
+                                    json.dumps(links, ensure_ascii=False) if links else None
+                                )
+                                embedded = element.get("_embedded")
+                                element["_embedded"] = (
+                                    json.dumps(embedded, ensure_ascii=False) if embedded else None
+                                )
+ 
                                 element["catalog_id"] = catalog_id
                                 element["catalog_name"] = catalog_name
                                 element["account_subdomain"] = conta
@@ -566,19 +617,19 @@ class KommoExtractor:
                                     dt.datetime.now(dt.timezone.utc).isoformat()
                                 )
                                 elementos_registros.append(element)
-
+ 
                     except ValueError as e:
                         self._send_to_dlq(
                             conta, f"listas_elementos/{catalog_name}",
                             [{"catalog_id": catalog_id}], str(e)
                         )
-
+ 
                 logger.info(f"[listas] {conta}: {len(catalogs)} catálogo(s) OK")
-
+ 
             except Exception as e:
                 self._send_to_dlq(conta, "listas", [resultado], str(e))
                 falhas.append(conta)
-
+ 
         if listas_registros:
             df_l = pd.DataFrame(listas_registros)
             df_l = self.elt.prepare_dataframe_for_load(df_l)
@@ -588,7 +639,7 @@ class KommoExtractor:
                 table_id="listas",
                 write_disposition="WRITE_TRUNCATE",
             )
-
+ 
         if elementos_registros:
             df_e = pd.DataFrame(elementos_registros)
             df_e = self.elt.prepare_dataframe_for_load(df_e)
@@ -598,11 +649,13 @@ class KommoExtractor:
                 table_id="listas_elementos",
                 write_disposition="WRITE_TRUNCATE",
             )
-
+ 
         logger.info(
             f"[listas] Concluído: {len(listas_registros)} lista(s), "
             f"{len(elementos_registros)} elemento(s) | {len(falhas)} falha(s)"
         )
+        logger.info(_SEP)
+
 
     def extrair_tarefas(self):
         """
@@ -610,7 +663,9 @@ class KommoExtractor:
         Destino: kommo_raw.tarefas
         Estratégia: WRITE_APPEND incremental.
         """
-        logger.info("=== Iniciando extração: tarefas ===")
+        logger.info(_SEP)
+        logger.info("  EXTRAÇÃO: TAREFAS")
+        logger.info(_SEP)
         falhas = []
         total_registros = 0
 
@@ -665,7 +720,7 @@ class KommoExtractor:
                 else:
                     logger.info(f"[tarefas] {conta}: sem novas tarefas desde {checkpoint}")
 
-            except (ValueError, Exception) as e:
+            except Exception as e:
                 logger.error(f"[tarefas] {conta}: {e}")
                 self._send_to_dlq(conta, "tarefas", [], str(e))
                 falhas.append(conta)
@@ -673,25 +728,29 @@ class KommoExtractor:
         logger.info(
             f"[tarefas] Concluído: {total_registros} registro(s) | {len(falhas)} falha(s)."
         )
+        logger.info(_SEP)
 
+    
     def extrair_leads(self):
         """
         Extrai leads com paginação e extração incremental por updated_at.
         Destino: kommo_raw.leads
         Estratégia: WRITE_APPEND incremental.
-
+ 
         Deleções são rastreadas via tabela de eventos (tipo 'lead_deleted'),
         não pelo campo is_deleted — a API do Kommo não retorna leads deletados
         no endpoint de listagem, independente do parâmetro with=is_deleted.
         """
-        logger.info("=== Iniciando extração: leads ===")
+        logger.info(_SEP)
+        logger.info("  EXTRAÇÃO: LEADS")
+        logger.info(_SEP)
         falhas = []
         total_registros = 0
 
         for conta in self.lista_clientes:
             dados = self.clientes[conta]
             checkpoint = self._get_checkpoint("leads", conta, "updated_at")
-
+ 
             filtro_data = ""
             if checkpoint:
                 ts = int(float(checkpoint))
@@ -699,30 +758,39 @@ class KommoExtractor:
                 logger.info(f"[leads] {conta}: incremental a partir de {checkpoint}")
             else:
                 logger.info(f"[leads] {conta}: sem checkpoint - full load inicial")
-
+ 
             url_inicial = (
                 f"https://{dados['url']}.kommo.com/api/v4/leads"
                 f"?with=source_id,contacts,loss_reason"
                 f"&page=1&limit=250{filtro_data}"
             )
-
+ 
             registros_conta = []
-
+ 
             try:
                 for pagina_leads, num_pagina in self._paginar(
                     url_inicial, conta, "leads"
                 ):
                     for lead in pagina_leads:
-                        for field in lead.pop("custom_fields_values", []) or []:
+                        # Extrai valores flattened dos custom fields
+                        for field in lead.get("custom_fields_values", []) or []:
                             values = field.get("values", [])
                             if values:
                                 lead[field["field_name"]] = values[0].get("value")
-
+ 
+                        # Serializa custom_fields_values para STRING
+                        # Garante idempotência com schema existente no BI
+                        cfv = lead.get("custom_fields_values")
+                        lead["custom_fields_values"] = (
+                            json.dumps(cfv, ensure_ascii=False) if cfv else None
+                        )
+ 
+                        # Extrai _embedded e serializa para STRING
                         embedded = lead.pop("_embedded", {}) or {}
                         for key, values in embedded.items():
                             if not isinstance(values, list) or not values:
                                 continue
-
+ 
                             if key == "tags":
                                 tag_comodo = next(
                                     (
@@ -736,19 +804,29 @@ class KommoExtractor:
                                 lead["tags_name"] = tag_comodo.get("name")
                             else:
                                 lead[f"{key}_id"] = values[0].get("id")
-
-                        lead.pop("_links", None)
+                                # Preserva o name para todos os embedded (ex: loss_reason_name)
+                                # Compatível com o comportamento do script original
+                                name = values[0].get("name")
+                                if name is not None:
+                                    lead[f"{key}_name"] = name
+ 
+                        # Serializa _links para STRING
+                        links = lead.get("_links")
+                        lead["_links"] = (
+                            json.dumps(links, ensure_ascii=False) if links else None
+                        )
+ 
                         lead["account_subdomain"] = conta
                         lead["_ingestion_timestamp"] = (
                             dt.datetime.now(dt.timezone.utc).isoformat()
                         )
                         registros_conta.append(lead)
-
+ 
                     logger.info(
                         f"[leads] {conta}: página {num_pagina} - "
                         f"{len(registros_conta)} lead(s) acumulado(s)"
                     )
-
+ 
                 if registros_conta:
                     df = pd.DataFrame(registros_conta)
                     df = self.elt.prepare_dataframe_for_load(df)
@@ -764,15 +842,17 @@ class KommoExtractor:
                     )
                 else:
                     logger.info(f"[leads] {conta}: sem novos leads desde {checkpoint}")
-
-            except (ValueError, Exception) as e:
+ 
+            except Exception as e:
                 logger.error(f"[leads] {conta}: {e}")
                 self._send_to_dlq(conta, "leads", [], str(e))
                 falhas.append(conta)
-
+ 
         logger.info(
             f"[leads] Concluído: {total_registros} registro(s) | {len(falhas)} falha(s)."
         )
+        logger.info(_SEP)
+
 
     def extrair_eventos(self):
         """
@@ -788,8 +868,9 @@ class KommoExtractor:
         eventos do tipo 'lead_deleted' são usados pela view SQL para
         excluir leads deletados sem depender do campo is_deleted.
         """
-        
-        logger.info("=== Iniciando extração: eventos ===")
+        logger.info(_SEP)
+        logger.info("  EXTRAÇÃO: EVENTOS")
+        logger.info(_SEP)
         falhas = []
         total_registros = 0
 
@@ -819,23 +900,42 @@ class KommoExtractor:
                     url_inicial, conta, "events"
                 ):
                     for event in pagina_eventos:
-                        value_before = event.pop("value_before", None) or []
+                        # Lê value_before, extrai flattened e serializa para STRING
+                        value_before = event.get("value_before", None) or []
                         if value_before and isinstance(value_before, list):
                             for k, v in value_before[0].items():
                                 event[f"{k}_before"] = v
+                        event["value_before"] = (
+                            json.dumps(value_before, ensure_ascii=False)
+                            if value_before else None
+                        )
 
-                        value_after = event.pop("value_after", None) or []
+                        # Lê value_after, extrai flattened e serializa para STRING
+                        value_after = event.get("value_after", None) or []
                         if value_after and isinstance(value_after, list):
                             for k, v in value_after[0].items():
                                 event[f"{k}_after"] = v
+                        event["value_after"] = (
+                            json.dumps(value_after, ensure_ascii=False)
+                            if value_after else None
+                        )
 
+                        # Extrai _embedded e serializa para STRING
                         embedded = event.pop("_embedded", {}) or {}
                         for key, values in embedded.items():
                             if isinstance(values, list) and values:
                                 event[f"{key}_id"] = values[0].get("id")
                                 event[f"{key}_name"] = values[0].get("name", "")
+                        event["_embedded"] = (
+                            json.dumps(embedded, ensure_ascii=False) if embedded else None
+                        )
 
-                        event.pop("_links", None)
+                        # Serializa _links para STRING
+                        links = event.get("_links")
+                        event["_links"] = (
+                            json.dumps(links, ensure_ascii=False) if links else None
+                        )
+
                         event["account_subdomain"] = conta
                         event["_ingestion_timestamp"] = (
                             dt.datetime.now(dt.timezone.utc).isoformat()
@@ -858,7 +958,7 @@ class KommoExtractor:
                 else:
                     logger.info(f"[eventos] {conta}: sem eventos na janela.")
 
-            except (ValueError, Exception) as e:
+            except Exception as e:
                 logger.error(f"[eventos] {conta}: {e}")
                 self._send_to_dlq(conta, "eventos", [], str(e))
                 falhas.append(conta)
@@ -866,26 +966,23 @@ class KommoExtractor:
         logger.info(
             f"[eventos] Concluído: {total_registros} registro(s) | {len(falhas)} falha(s)"
         )
+        logger.info(_SEP)
 
 
 def main():
-    # Sem renovar_chaves() em massa — tokens Kommo têm validade longa.
-    # Renovação acontece sob demanda no _authenticated_request()
-    # quando uma conta específica retorna 401 durante a extração.
     extractor = KommoExtractor()
 
     # Dimensões - WRITE_TRUNCATE, sem incremental
     extractor.extrair_contas()
-    extractor.extrair_tags()
-    extractor.extrair_usuarios()
-    extractor.extrair_pipelines_e_statuses()
-    extractor.extrair_listas()
+    # extractor.extrair_tags()
+    # extractor.extrair_usuarios()
+    # extractor.extrair_pipelines_e_statuses()
+    # extractor.extrair_listas()
 
     # Fatos - incrementais, WRITE_APPEND
-    extractor.extrair_tarefas()
-    extractor.extrair_leads()
+    # extractor.extrair_tarefas()
+    # extractor.extrair_leads()
     extractor.extrair_eventos()
-
 
 if __name__ == "__main__":
     main()

@@ -3,6 +3,7 @@ import re
 import logging
 import unicodedata
 import datetime as dt
+import json
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -121,12 +122,12 @@ class ELTExecutor:
         job_config = bigquery.LoadJobConfig(
             write_disposition=write_disposition,
             schema=schema if schema else [],
-            # Permite adicionar novos campos automaticamente quando contas
-            # possuem campos customizados que outras não têm.
-            # Sem isso, o BQ rejeita qualquer load com colunas novas.
-            schema_update_options=[
-                bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
-            ],
+            # ALLOW_FIELD_ADDITION só é válido com WRITE_APPEND
+            schema_update_options=(
+                [bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION]
+                if write_disposition == bigquery.WriteDisposition.WRITE_APPEND
+                else []
+            ),
         )
 
         try:
@@ -154,7 +155,9 @@ class ELTExecutor:
     # EXTRACT — BIGQUERY LEITURA (suporte à extração incremental)
     # ------------------------------------------------------------------
 
-    def query_bigquery(self, sql: str, table_name: str) -> pd.DataFrame:
+    def query_bigquery(
+        self, sql: str, table_name: str, job_config=None
+    ) -> pd.DataFrame:
         """
         Executa uma consulta SQL no BigQuery.
         Utilizado principalmente para buscar checkpoints de extração incremental
@@ -162,11 +165,12 @@ class ELTExecutor:
 
         :param sql: Consulta SQL a ser executada.
         :param table_name: Nome da tabela (usado apenas para logging).
+        :param job_config: QueryJobConfig opcional (ex: para queries parametrizadas).
         :return: DataFrame com os resultados.
         """
         try:
             logger.info(f"Consultando BigQuery: {table_name}")
-            df = self.bigquery_client.query(sql).to_dataframe()
+            df = self.bigquery_client.query(sql, job_config=job_config).to_dataframe()
             logger.info(
                 f"Consulta concluída: {len(df)} registros retornados de {table_name}"
             )
@@ -234,13 +238,23 @@ class ELTExecutor:
         :return: DataFrame pronto para o load.
         """
         df = self.rename_duplicate_columns(df)
+
+        # Converte colunas object que contenham dicts ou listas para string
+        # Evita erro de conversão pyarrow para tipos mistos
+        for col in df.select_dtypes(include="object").columns:
+            if df[col].dropna().apply(lambda x: isinstance(x, (dict, list))).any():
+                df[col] = df[col].apply(
+                    lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (dict, list)) else x
+                )
+
         logger.info(
             f"DataFrame preparado para load: {len(df)} registros, {len(df.columns)} colunas."
         )
+
         return df
 
     # ------------------------------------------------------------------
-    # UTILITÁRIOS DE DATA
+    # UTILITÁRIOS DE TIMESTAMP
     # ------------------------------------------------------------------
 
     def data_milissegundos(self, day: int) -> int:
